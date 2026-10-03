@@ -30,6 +30,7 @@ const RPC = "https://studio.genlayer.com/api";
 const EXPLORER = "https://explorer-studio.genlayer.com";
 const FEE = 10n ** 17n;            // 0.1 GEN, must match the deployed scan fee
 const WINDOW = 900;
+const ONLY_ABANDON = process.argv.includes("--abandon-only");
 
 const plain = (v) => JSON.parse(JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x instanceof Map ? Object.fromEntries(x) : x)));
 const show = (v) => JSON.stringify(plain(v), null, 2);
@@ -78,7 +79,7 @@ const DOCS = [
 
 console.log("contract", CONTRACT, "\n");
 const ids = {};
-for (const d of DOCS) {
+for (const d of (ONLY_ABANDON ? [] : DOCS)) {
   const text = readFileSync(path.join(ROOT, "demo", d.file), "utf8");
   d.text = normalize(text);
   d.hash = hashOf(text);
@@ -89,7 +90,7 @@ for (const d of DOCS) {
   console.log("  stored on-chain:", show(await read("get_document", [ids[d.key]])));
 }
 
-for (const d of DOCS) {
+for (const d of (ONLY_ABANDON ? [] : DOCS)) {
   console.log(`\nScanning ${d.key} (${d.title})`);
   const { exec } = await send(keeper, "scan", [ids[d.key]], `scan ${d.key}`);
   const doc = await read("get_document", [ids[d.key]]);
@@ -101,17 +102,58 @@ for (const d of DOCS) {
     redacted_hash: field(doc, "redacted_hash"),
   }));
   if (exec === "SUCCESS" && field(doc, "status") !== "PENDING") {
-    const local = await read("verify_locally", [ids[d.key], d.text]);
-    console.log("  publisher side:", show({
-      hash_matches: field(local, "hash_matches"),
-      redaction_matches: field(local, "redaction_matches"),
-      redacted: field(local, "redacted"),
-    }));
+    try {
+      const local = await read("verify_locally", [ids[d.key], d.text]);
+      console.log("  publisher side:", show({
+        hash_matches: field(local, "hash_matches"),
+        redaction_matches: field(local, "redaction_matches"),
+        redacted: field(local, "redacted"),
+      }));
+    } catch (e) {
+      // Studionet's read RPC refuses view calls whose string argument is longer than
+      // roughly 230 characters. The same check runs off-chain: the redaction is a pure
+      // function of the text and the stored locators.
+      console.log("  publisher side: verify_locally skipped (Studionet read RPC string limit)");
+      const locs = (field(doc, "findings") || []).map((f) => (f instanceof Map ? Object.fromEntries(f) : f));
+      let out = "", cursor = 0;
+      for (const l of [...locs].sort((a, b) => a.start - b.start)) {
+        out += d.text.slice(cursor, l.start) + "[redacted]";
+        cursor = l.start + l.length;
+      }
+      out += d.text.slice(cursor);
+      console.log("  redaction rebuilt locally:", JSON.stringify(out));
+      console.log("  matches stored hash:", hashOf(out) === field(doc, "redacted_hash"));
+    }
   }
 }
 
+// The recovery path: a document nobody settles before the deadline is abandoned by its
+// publisher, who takes the scan fee back. Uses the minimum 10 minute scan window.
+if (process.argv.includes("--with-abandon") || ONLY_ABANDON) {
+  console.log("");
+  console.log("Document D: never scanned, to demonstrate the refund path");
+  const dHash = hashOf("This draft exists only to show the abandon path and is never scanned by anyone.");
+  await send(publisher, "submit", ["Abandoned draft", POLICY, BASE + "/never-scanned.txt", dHash, 600], "submit D", FEE);
+  const abandonId = Number(field(await read("get_accounting"), "documents"));
+  const deadline = Number(field(await read("get_document", [abandonId]), "scan_deadline"));
+  const waitMs = (deadline + 15) * 1000 - Date.now();
+  console.log("  waiting " + Math.ceil(waitMs / 1000) + "s for the scan window to close");
+  await new Promise((r) => setTimeout(r, Math.max(waitMs, 0)));
+  const before = String(await read("get_credit", [publisher.acc.address]));
+  const blocked = await send(keeper, "scan", [abandonId], "scan D after deadline");
+  await send(publisher, "abandon", [abandonId], "abandon D");
+  const after = await read("get_document", [abandonId]);
+  console.log("  ->", show({
+    scan_after_deadline: blocked.exec,
+    status: field(after, "status"),
+    reason: field(after, "reason"),
+    publisher_credit_before: before,
+    publisher_credit_after: String(await read("get_credit", [publisher.acc.address])),
+  }));
+}
+
 console.log("\ncertificates:");
-for (const d of DOCS) console.log(`  ${d.key}:`, show(await read("is_cleared", [d.hash])));
+for (const d of (ONLY_ABANDON ? [] : DOCS)) console.log(`  ${d.key}:`, show(await read("is_cleared", [d.hash])));
 console.log("\nkeeper credit:", String(await read("get_credit", [keeper.acc.address])));
 console.log("accounting:", show(await read("get_accounting")));
 console.log("\nexplorer:");

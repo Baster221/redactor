@@ -2,18 +2,22 @@
 
 **A clean bill of health is only clean if nobody found anything.**
 
-Before a DAO, a research group or a support team publishes a document, somebody has to check it for things that must not go out: customer emails and phone numbers, card numbers, API keys, bank details, private facts about named people. Redactor makes that check a transaction. The publisher pays a scan fee, a keeper runs the scan, and the contract records either a **CLEAN certificate** (this exact text is cleared for release) or a **FLAGGED report** with the spans that have to go and a deterministic redaction.
+Before a DAO, a research group or a support team publishes a document, somebody has to check it for things that must not go out: customer emails and phone numbers, card numbers, API keys, bank details, private facts about named people. Redactor makes that check a transaction.
 
-**Live on GenLayer Studionet:** [`0xd3656166a557DDF3F0c7Aff025309C85b833e218`](https://explorer-studio.genlayer.com/address/0xd3656166a557DDF3F0c7Aff025309C85b833e218)
+The document itself never touches the chain. The publisher commits a **URL and a SHA-256**; validators fetch the text themselves, refuse to scan anything that does not hash to the commitment, and record either a **CLEAN certificate** for that exact hash or a **FLAGGED report** of **locators** — category, start offset, length — plus the hash of the redacted copy. No document text, no sensitive span and no redacted copy is ever written to storage.
+
+**Live on GenLayer Studionet:** [`0x0b715Fa8cE9E85573499Be4380111B5430ed1f23`](https://explorer-studio.genlayer.com/address/0x0b715Fa8cE9E85573499Be4380111B5430ed1f23)
 
 ---
 
 ## Contents
 
+- [What changed after review](#what-changed-after-review)
+- [Nothing sensitive reaches the chain](#nothing-sensitive-reaches-the-chain)
 - [Consensus: unanimity on absence, evidence on presence](#consensus-unanimity-on-absence-evidence-on-presence)
 - [The deterministic layer](#the-deterministic-layer)
 - [The model layer](#the-model-layer)
-- [Lifecycle](#lifecycle)
+- [Lifecycle and the recovery path](#lifecycle-and-the-recovery-path)
 - [Threat model](#threat-model)
 - [Live run on Studionet](#live-run-on-studionet)
 - [Public interface](#public-interface)
@@ -22,6 +26,51 @@ Before a DAO, a research group or a support team publishes a document, somebody 
 - [Limitations](#limitations)
 
 ---
+
+## What changed after review
+
+Review raised two mandatory issues against the first version, and both are fixed here.
+
+> *"Do not put the unredacted document or exact sensitive spans into publicly readable contract state (the current submit/get_document flow exposes the material before redaction)."*
+
+The first version took the document as an argument to `submit()` and stored it, then stored the findings as quoted spans and the redacted text. On a public chain that republished exactly what the gate exists to protect. The data model is now commit-and-fetch:
+
+| | v1 | v2 |
+|---|---|---|
+| What `submit()` takes | the full document text | a **URL and a SHA-256 commitment** |
+| What storage holds | document, spans, redacted text | url, hash, **locators (category, start, length)**, redaction **hash** |
+| How a node reads the text | from storage | fetches it inside the nondeterministic block, and refuses to scan unless it hashes to the commitment |
+| How the publisher checks the result | read it back from the chain | `verify_locally(id, text)` in a view, or recompute off-chain from the locators |
+| Certificate lookup | `is_cleared(text)` — sent the document to a node | `is_cleared(hash)` |
+
+`test_privacy.py` asserts the property directly: after submitting and scanning a document full of test data, no email, card number, IBAN, key, phone number, sentence, or even the string `[redacted]` appears anywhere in `get_document()`.
+
+> *"Add a defined timeout or cancellation path that lets the publisher recover the scan fee when repeated validator disagreement leaves a document PENDING."*
+
+Contextual PII is a judgement call, so rounds really do fail to settle — the v1 live run showed exactly that, with three of five validators refusing a CLEAN claim. v2 makes that recoverable:
+
+- `submit()` takes a `scan_window_seconds` (10 minutes to 30 days) and stores a deadline,
+- `scan()` reverts once the window closes, so there is no race with the exit,
+- `abandon()` lets the **publisher** reclaim the full scan fee afterwards and marks the document `ABANDONED`,
+- an unreachable link or a hash mismatch settles nothing and pays nobody, so those rounds also end at the same exit.
+
+## Nothing sensitive reaches the chain
+
+```
+publisher                     chain                         validators
+   | host the document          |                               |
+   | submit(url, sha256, fee) ->|  url + hash + fee             |
+   |                            |------------- scan() --------->| fetch url
+   |                            |                               | sha256 must equal the commitment
+   |                            |<-- verdict + locators + ------| detectors + model
+   |                            |    redaction hash             |
+   | verify_locally(text) ----->|  rebuild the redaction        |
+```
+
+What a reader of the chain learns about a flagged document: that it has, say, an `EMAIL` at offset 42 of length 20. Not the address. The redaction hash lets the publisher prove their redacted copy is the agreed one without publishing either copy.
+
+This is as private as a public network allows, and the README is explicit about the remaining exposure: validators must be able to read the document while they scan it, so the link is public for that window. A publisher should host it somewhere unguessable or access-limited and take it down afterwards; the commitment keeps the certificate meaningful once the link is gone.
+
 
 ## Consensus: unanimity on absence, evidence on presence
 
@@ -33,21 +82,26 @@ Safety here is asymmetric, so the consensus rule is asymmetric too.
 
 | Check on every leader finding | Where it runs |
 |---|---|
-| the span appears verbatim in the on-chain document | deterministic, every node |
+| the locator points inside the document **this node fetched** | deterministic, every node |
 | a structured finding satisfies its own detector (Luhn, mod-97, entropy, shape) | deterministic, every node |
 | a contextual finding is confirmed by *this validator's own* model | second model pass, every node |
 | nothing this node found is missing from the report | the unanimity rule above |
-| the report is canonical (sorted, deduplicated, bounded) | deterministic, every node |
+| the report is canonical (sorted, deduplicated, ≤ 12 findings) | deterministic, every node |
+| the redaction hash equals the hash of this node's own redaction | deterministic, every node |
+| the verdict follows the findings, and a mismatch or an unreachable link settles nothing | deterministic, every node |
 
-The stored verdict, the categories and the redaction are then recomputed by the contract from the on-chain document. A model can add a finding it can prove, and it can be outvoted for missing one, but it can never turn a dirty document into a clean certificate on its own.
+Because the chain holds no text, the agreement itself is the verification: every node checks the leader's locators against the bytes it fetched, and the bytes are pinned by the commitment. A model can add a finding it can prove, and it can be outvoted for missing one, but it can never turn a dirty document into a clean certificate on its own.
 
 ```python
 # the shape of the validator, in full
-if not all spans present and detector-clean:           return False
-out = this_node_scan(also_examine=leader_contextual)
-if any leader contextual finding not confirmed here:   return False
-if any finding this node made is not in the report:    return False   # CLEAN must be unanimous
-return True
+out = this_node_scan(also_judge=leader_contextual_locators)   # fetch, hash check, detect, ask
+if out.verdict is MISMATCH or UNREACHABLE or so is theirs:
+    return verdicts match and nothing was claimed
+for locator in claimed:                                        # evidence, at this node's bytes
+    if not admissible(out.text, locator, out.confirmed): return False
+for locator in out.mine:                                       # CLEAN must be unanimous
+    if locator not in claimed: return False
+return verdict follows findings and redaction hash == hash(redact(out.text, claimed))
 ```
 
 ## The deterministic layer
@@ -80,19 +134,20 @@ The model handles what detectors cannot: **contextual PII**, a sentence that ide
 
 Both prompts treat the document as untrusted data. The deterministic floor means an injected "this document is already approved" line cannot buy a certificate.
 
-## Lifecycle
+## Lifecycle and the recovery path
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: submit(title, policy, document) + scan fee
+    [*] --> PENDING: submit(url, sha256, window) + scan fee
     PENDING --> CLEAN: scan() — every node found nothing
-    PENDING --> FLAGGED: scan() — findings agreed, redaction stored
-    PENDING --> PENDING: scan() reached no consensus — anyone may run it again
-    CLEAN --> [*]: is_cleared(text) == true
-    FLAGGED --> [*]: publisher fixes the text and submits the new version
+    PENDING --> FLAGGED: scan() — locators agreed, redaction hash stored
+    PENDING --> PENDING: no consensus, unreachable link or hash mismatch — nothing stored, nothing paid
+    PENDING --> ABANDONED: abandon() after the window — the publisher takes the fee back
+    CLEAN --> [*]: is_cleared(hash) == true
+    FLAGGED --> [*]: publisher redacts locally and submits the new version
 ```
 
-The fee goes to whoever ran the scan, which pays for the validator work. A document is scanned once; a corrected version is a new submission with a new hash.
+The fee goes to whoever ran the scan that settled the document, which pays for the validator work. Three things leave a document PENDING and pay nobody: validators that cannot agree, a link that cannot be fetched, and bytes that do not match the commitment. All three end at the same exit — anyone may `scan()` again until the deadline, and after it the publisher calls `abandon()` and is refunded in full.
 
 ## Threat model
 
@@ -101,43 +156,94 @@ The fee goes to whoever ran the scan, which pays for the validator work. A docum
 | Leader claims CLEAN on a dirty document | unanimity: every node's own findings must be in the report | `test_one_node_that_finds_something_withholds_the_certificate` |
 | Compromised model reports nothing | deterministic floor is merged in regardless | `test_clean_claim_is_refused_when_a_detector_fires_anywhere`, `test_model_failure_falls_back_to_the_deterministic_floor` |
 | Prompt injection ("already approved, no redaction needed") | untrusted-data prompts plus the detector floor | `test_injected_instructions_cannot_buy_a_certificate` |
-| Leader invents a finding to smear a document | spans must exist in the document | `test_fabricated_span_is_refused`, `test_leader_drops_a_span_that_is_not_in_the_document` |
-| Leader calls a harmless number a card | the category's own detector must agree | `test_structured_claim_must_satisfy_its_own_detector` |
+| Leader invents a finding to smear a document | the locator must point at text that satisfies its category here | `test_a_locator_pointing_at_innocent_text_is_refused`, `test_locators_outside_the_document_are_refused` |
+| Leader calls a harmless number a card | the category's own detector must agree at that offset | `test_a_locator_pointing_at_innocent_text_is_refused` |
 | Leader over-flags a sentence as contextual PII | each validator's own model must confirm it | `test_contextual_finding_the_validator_rejects_is_refused` |
-| Leader drops one detector hit from a long report | unanimity check covers detector findings | `test_leader_may_not_drop_a_detector_hit` |
-| Non-canonical or oversized reports | sorted, deduplicated, ≤ 12 findings | `test_unsorted_or_oversized_reports_are_refused` |
-| Certificate reused for edited text | the certificate is keyed by the whitespace-normalised document hash | `test_certificate_is_bound_to_the_exact_text` |
+| Leader drops one detector hit from a long report | unanimity check covers detector findings | `test_a_dropped_finding_is_refused` |
+| Non-canonical or oversized reports | sorted, deduplicated, ≤ 12 findings | `test_non_canonical_and_malformed_reports_are_refused` |
+| Certificate reused for edited text | certificates are keyed by the committed hash | `test_certificates_are_looked_up_by_hash_not_by_text` |
+| **The chain republishing what it screens** | no method takes the text; storage holds a url, a hash and offsets | `test_submission_never_carries_the_document`, `test_a_flagged_report_stores_locations_not_text` |
+| **Document swapped after submission** | every node refuses to scan unless the fetched bytes hash to the commitment | `test_the_scan_refuses_a_document_that_does_not_match_its_commitment` |
+| **Leader faking a mismatch to stall** | the other nodes fetched it fine, so the verdict is refused | `test_a_claimed_mismatch_must_be_seen_by_this_node_too` |
+| **Fee stuck behind endless disagreement** | scan window plus `abandon()` refund | `test_a_document_that_never_settles_can_be_abandoned_for_a_refund` |
+| Refund taken twice, or after a scan settled | `abandon()` only while PENDING, only after the deadline | `test_abandon_cannot_take_the_fee_twice_or_after_a_scan` |
 | Double scan / unpaid keeper | one scan per document, fee credited to the caller | `test_scan_pays_the_keeper_and_runs_once` |
 
 ## Live run on Studionet
 
-Reproduce with `node scripts/studionet_demo.mjs <contract>`. Contract [`0xd3656166a557DDF3F0c7Aff025309C85b833e218`](https://explorer-studio.genlayer.com/address/0xd3656166a557DDF3F0c7Aff025309C85b833e218), deployed with the GenLayer CLI from this exact source (0.1 GEN scan fee), scanned by real validators.
+Reproduce with `node scripts/studionet_demo.mjs <contract> [--with-abandon]`. Contract
+[`0x0b715Fa8cE9E85573499Be4380111B5430ed1f23`](https://explorer-studio.genlayer.com/address/0x0b715Fa8cE9E85573499Be4380111B5430ed1f23), deployed with the GenLayer CLI from
+this exact source, 0.1 GEN scan fee, scanned by real validators. The three demo documents are
+synthetic fixtures in `demo/`, served over https so validators can fetch them; every value in
+them is fake (`4111 1111 1111 1111` is the standard test card, `GB82WEST12345698765432` the
+ISO 13616 example IBAN).
 
 | Document | Transaction | Result |
 |---|---|---|
-| **A.** release notes, nothing personal | [`0x6ebdbdde…238ee2`](https://explorer-studio.genlayer.com/tx/0x6ebdbdde9b47c260f304dcbf51c9784242a3eaaa867f0896dae459b50b238ee2) | **CLEAN**, certificate issued (`is_cleared` → true, hash `0x9b0ea2c6…79d6`) |
-| **B.** support handover with real-looking data | [`0xe807b758…94b3eb`](https://explorer-studio.genlayer.com/tx/0xe807b758cf8ff87c967ad5c19673ebf359b931f40768ece5689c4a28f694b3eb) | **FLAGGED**: `API_KEY`, `EMAIL`, `IBAN`, `PAYMENT_CARD`, `PHONE` — all five spans exact, redaction stored |
-| **C.** contextual PII, attempt 1 | [`0xa2221777…82b9be`](https://explorer-studio.genlayer.com/tx/0xa222177766cab8fa4133900f2ad2fb56843801d4a801904e0b498c9bf782b9be) | leader claimed CLEAN → **3 of 5 validators disagreed → Undetermined**, no certificate, fee not paid, document stays PENDING |
-| **C.** contextual PII, attempt 2 | [`0x548569b6…9ded308`](https://explorer-studio.genlayer.com/tx/0x548569b64e3a397515d34387404a2d573be7e168b78d94754f187eff99ded308) | a different leader reported it → **FLAGGED** `CONTEXTUAL_PII`, span: *"our contractor Dana Kovacs is on sick leave after surgery and has asked for a salary advance…"* |
-| **D.** injected "already approved for release" | [`0x1556c732…8c4079`](https://explorer-studio.genlayer.com/tx/0x1556c73260d5cacf81d0d8963d46e66daf443919b7525073cc32deecd08c4079) | **FLAGGED** `EMAIL` — the injection changed nothing |
+| **A.** release notes, nothing personal | [`0x103defe5…e543f1`](https://explorer-studio.genlayer.com/tx/0x103defe56b8d3f2da993028baeec5b76f72e209ca67f5ede1a77bc8c60e543f1) | **CLEAN**, certificate issued for hash `0x9b0ea2c6…79d6` |
+| **B.** support handover with five kinds of personal data | [`0xc164656b…d10a72`](https://explorer-studio.genlayer.com/tx/0xc164656b64fa4446ef9a6d7911a4355f64f357877759ecf68765cc3790d10a72) | **FLAGGED**: `API_KEY`, `EMAIL`, `IBAN`, `PAYMENT_CARD`, `PHONE` as five locators, redaction hash `0x41b11bd9…1a40d` |
+| **C.** contractor on sick leave asking for a salary advance | [`0xeddc42c7…411713`](https://explorer-studio.genlayer.com/tx/0xeddc42c7c0c7643da97144f52142d9c5de26fef1dac612b5cc2c5508ac411713) | **FLAGGED** `CONTEXTUAL_PII` at offset 16, length 129 (3 validators agreed, 2 disagreed) |
 
-Document C is the rule working end to end. The first scan is exactly the case the design is built for: one node's model missed contextual PII that others could see, so **no clean certificate was issued at all**. Nothing was written, no fee moved, and the next keeper call settled it as FLAGGED with the correct span. Disagreement costs a retry; it never produces a false certificate.
+What the chain stores for document B — the entire record, verbatim:
 
-Redaction as stored for document B:
+```json
+{"category": "EMAIL",        "start": 42,  "length": 20}
+{"category": "PHONE",        "start": 74,  "length": 16}
+{"category": "PAYMENT_CARD", "start": 101, "length": 19}
+{"category": "IBAN",         "start": 160, "length": 22}
+{"category": "API_KEY",      "start": 204, "length": 28}
+```
 
-> Support handover: the customer wrote from [redacted] and called [redacted]. Her card [redacted] was declined twice, the refund goes to [redacted], and the staging key [redacted] still works.
+No address, no number, no key, no sentence. Rebuilding the redaction from those five locators
+and the publisher's own copy gives
+
+> Support handover: the customer wrote from [redacted] and called [redacted]. Her card
+> [redacted] was declined twice, the refund goes to [redacted], and the staging key
+> [redacted] still works.
+
+whose hash equals the `redacted_hash` the validators agreed on — the demo prints
+`matches stored hash: true` for both flagged documents.
+
+### The recovery path, on chain
+
+Reproduce with `--with-abandon`. Document D is submitted with the minimum 10 minute window and
+deliberately never scanned, which is the same end state as a document validators keep failing
+to agree on.
+
+| Step | Transaction | Result |
+|---|---|---|
+| **Submit D** with a 600 second window, 0.1 GEN fee | [`0x3bd5bc44...709961`](https://explorer-studio.genlayer.com/tx/0x3bd5bc445953ff397d5f17dc78d98dfa5c7ca4ec816f9de8d388a6764e709961) | `SUCCESS`, `PENDING`, deadline stored |
+| **Scan D after the deadline** | [`0x37146fb8...ec07ed`](https://explorer-studio.genlayer.com/tx/0x37146fb817ad1b6b788fa5673b078b8feb521ca60c418039e30ba20001ec07ed) | `ERROR` — the window is closed, so there is no race with the exit |
+| **Abandon D** (publisher) | [`0x98826404...3f3da8`](https://explorer-studio.genlayer.com/tx/0x98826404d384157ac634ac439b2e6e9feebd0dbcc63e34e07831241a8a3f3da8) | `SUCCESS`, status `ABANDONED`, reason `abandoned_after_deadline` |
+
+The publisher's withdrawable credit before and after, read straight from the contract:
+
+```
+publisher_credit_before: 0
+publisher_credit_after:  100000000000000000   # the whole 0.1 GEN scan fee, back
+```
+
+`get_accounting()` then reports `total_fees_held_wei: 0` — nothing of document D's fee stayed
+in the contract. A publisher whose document never settles waits out the window they chose and
+is made whole; nobody is paid for a scan that produced no verdict.
+
+> The rejected first version is still on chain at
+> [`0xd3656166a557DDF3F0c7Aff025309C85b833e218`](https://explorer-studio.genlayer.com/address/0xd3656166a557DDF3F0c7Aff025309C85b833e218) for comparison. Its `get_document`
+> returns the full text and the quoted spans, which is exactly what this version removes.
 
 ## Public interface
 
 | Method | Kind | Who |
 |---|---|---|
 | `__init__(scan_fee_wei)` | constructor | deployer |
-| `submit(title, policy, document) → id` | payable | publisher, exact fee |
-| `scan(id) → {status, categories, findings, doc_hash, fee_paid_wei}` | write (nondet) | anyone; the fee pays the caller |
-| `withdraw()` | write | keeper |
-| `get_document(id)` | view | text, status, findings with spans, redaction, hash, scanner |
-| `is_cleared(document)` | view | does this exact text hold a certificate |
-| `detect(document)` | view | **the deterministic layer alone**, no model |
+| `submit(title, policy, url, document_hash, scan_window_seconds) → id` | payable | publisher, exact fee |
+| `scan(id) → {status, reason, findings, categories, redacted_hash, fee_paid_wei}` | write (nondet) | anyone, before the deadline; the fee pays the caller |
+| `abandon(id) → refund` | write | **publisher, after the deadline** |
+| `withdraw()` | write | keeper or publisher |
+| `get_document(id)` | view | url, hash, status, **locators only**, redaction hash, deadline |
+| `is_cleared(document_hash)` | view | does this hash hold a certificate |
+| `verify_locally(id, document)` | view | **for whoever has the text**: rebuilds the redaction from the stored locators and checks both hashes |
+| `detect(document)` | view | the deterministic layer alone, no model, nothing stored |
 | `check_span(category, span)` | view | why a span is or is not admissible (Luhn, entropy, shape) |
 | `get_config`, `get_credit`, `get_accounting` | view | |
 
@@ -145,17 +251,18 @@ Redaction as stored for document B:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                     # 57 passed
-python scripts/mutation_check.py           # 28/28 mutants killed
+pytest                                     # 75 passed
+python scripts/mutation_check.py           # 34/34 mutants killed
 genvm-lint check contracts/redactor.py     # lint + SDK validation passed
 ```
 
 | File | Covers |
 |---|---|
-| `tests/direct/test_detectors.py` | Luhn, IBAN mod-97, entropy and key hints, phone digit range, cards next to phones, reference numbers, version numbers, redaction, hash normalisation |
-| `tests/direct/test_consensus.py` | CLEAN unanimity, a node that finds more, detector floor, fabricated spans, wrong-category claims, contextual confirmation and rejection, canonical reports, model outage, injection |
-| `tests/direct/test_lifecycle.py` | submission validation, exact fee, single scan, keeper payment, certificates bound to the text, accounting, constructor validation |
-| `scripts/mutation_check.py` | removes 28 guards one at a time (unanimity, contextual confirmation, each detector, fee and certificate rules); every removal breaks a test. Three defensive checks are deliberately excluded and documented in the script, because no test can distinguish them |
+| `tests/direct/test_privacy.py` (8) | nothing sensitive in stored state after submit or after a flagged scan, locators that rebuild the redaction locally, certificates by hash, commitment mismatch, unreachable document |
+| `tests/direct/test_detectors.py` (28) | Luhn, IBAN mod-97, entropy and key hints, phone digit range, cards next to phones, reference numbers, version numbers, redaction, hash normalisation |
+| `tests/direct/test_consensus.py` (18) | CLEAN unanimity, dropped findings, locators pointing at innocent or out-of-range text, wrong redaction hash, non-canonical reports, faked and real mismatches, contextual confirmation and rejection, model outage, injection |
+| `tests/direct/test_lifecycle.py` (21) | submission and URL validation, scan window, keeper payment, **the abandon refund path**, double-refund protection, rescan after a round that settled nothing, accounting |
+| `scripts/mutation_check.py` | removes 34 guards one at a time (commitment check, unanimity, locator admissibility, redaction hash, each detector, scan window, abandon rules); every removal breaks a test. A few structural properties and indistinguishable defensive checks are excluded and documented in the script |
 
 ## Reusing the primitive
 
@@ -170,10 +277,11 @@ The recipe: put a deterministic floor under the model so the easy cases never de
 
 ## Limitations
 
+- Validators must be able to read the document while they scan it, so the link is public for that window. Host it somewhere unguessable or access-limited, and take it down afterwards: the commitment keeps the certificate meaningful once the link is gone. A public blockchain cannot screen a document nobody is allowed to read.
+- A document that changes between submission and scan simply never settles, by design. The publisher resubmits with the new hash.
 - Detectors are tuned for Latin-script, English-style documents; other phone and ID formats need their own detectors.
-- Contextual PII is a judgement call, so a round can end Undetermined and need a retry. That is the intended failure direction, but it costs liveness.
-- A document that is genuinely ambiguous may never get a certificate. Publishing the redacted version is the way forward.
-- Studionet's read RPC rejects view calls whose string argument is longer than roughly 230 characters, so `is_cleared(text)` on a long document has to be called from another contract; `get_document(id)` returns the same state. This is a network limit, not a contract limit, and the direct-mode tests exercise full-length documents.
+- Contextual PII is a judgement call, so rounds can fail to settle. That is the intended failure direction, and `abandon()` bounds the cost to one scan fee of waiting.
+- Studionet's read RPC rejects view calls whose string argument is longer than roughly 230 characters, so `verify_locally()` on a long document has to be called from another contract or recomputed off-chain. The redaction is a pure function of the text and the stored locators, so the demo script rebuilds it locally when the RPC refuses the call.
 - `withdraw()` uses `emit_transfer`, which direct-mode tests do not simulate; the credit accounting around it is fully tested.
 
 ## License

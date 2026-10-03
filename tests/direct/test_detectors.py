@@ -129,6 +129,6 @@ def test_contextual_category_has_no_deterministic_detector(env):
 
 
 def test_doc_hash_is_whitespace_insensitive(env):
-    a = env["c"].is_cleared(CLEAN_DOC)["doc_hash"]
-    b = env["c"].is_cleared("  " + CLEAN_DOC.replace(" ", "  ") + "\n")["doc_hash"]
+    a = env["c"].detect(CLEAN_DOC)["doc_hash"]
+    b = env["c"].detect("   " + CLEAN_DOC.replace(" ", "  ") + "   ")["doc_hash"]
     assert a == b and a.startswith("0x") and len(a) == 66

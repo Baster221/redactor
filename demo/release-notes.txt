@@ -1,0 +1,1 @@
+Release notes for the indexer: we reduced reorg handling latency, added a health endpoint and documented the retry policy. The upgrade window opens on Thursday and no action is required from operators.
